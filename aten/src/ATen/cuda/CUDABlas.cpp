@@ -2361,9 +2361,16 @@ void int8_gemm(
   int32_t beta_val = 0;
   cublasLtHandle_t ltHandle = at::cuda::getCurrentCUDABlasLtHandle();
 
-#ifdef USE_ROCM
+  // Use Lt heuristics with a non-zero workspace budget, matching the other
+  // Lt GEMM paths (e.g. gemm_and_bias). The previous CUDA nullptr-algo /
+  // zero-workspace path was an old INT8 workaround, but a zero workspace budget
+  // prevents workspace-requiring algorithms from being selected on newer
+  // architectures.
   CuBlasLtMatmulPreference preference;
   auto ltworkspace = CublasLtWorkspace();
+  TORCH_CHECK(
+      ltworkspace.ptr != nullptr,
+      "OOM trying to allocate workspace for cublaslt");
   preference.setAttribute(CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, ltworkspace.size);
   cublasLtMatmulHeuristicResult_t heuristicResult = {};
   int returnedResult = 0;
@@ -2381,7 +2388,6 @@ void int8_gemm(
   if (returnedResult == 0) {
     TORCH_CUDABLAS_CHECK(CUBLAS_STATUS_NOT_SUPPORTED);
   }
-#endif
 
   cublasStatus_t cublasStatus = cublasLtMatmul(
       ltHandle,
@@ -2396,21 +2402,9 @@ void int8_gemm(
       Cdesc.descriptor(),
       result_ptr,
       Cdesc.descriptor(),
-#ifdef USE_ROCM
       &heuristicResult.algo,
-#else
-      nullptr, // Heuristics don't seem to work for int8
-#endif
-#ifdef USE_ROCM
       ltworkspace.ptr,
-#else
-      nullptr, // Non-zero workspace doesn't seem to work.
-#endif
-#ifdef USE_ROCM
       ltworkspace.size,
-#else
-      0,
-#endif
       stream);
   TORCH_CHECK(
       cublasStatus == CUBLAS_STATUS_SUCCESS,
