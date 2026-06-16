@@ -12,6 +12,7 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/util/irange.h>
 #include <c10/util/SmallVector.h>
+#include <c10/util/ScopeExit.h>
 
 #include <unordered_map>
 
@@ -927,6 +928,18 @@ void _cholesky_solve_helper_cuda_cusolver(Tensor& self, const Tensor& A, bool up
   TORCH_INTERNAL_ASSERT_DEBUG_ONLY(infos.item().toInt() == 0);
 }
 
+namespace {
+// Defined in the anonymous namespace lower in this file; declared here so the
+// looped cuSOLVER paths above those definitions (e.g. geqrf) can use them.
+void record_tensor_on_stream(const Tensor& t, c10::cuda::CUDAStream stream);
+void record_dataptr_on_stream(const c10::DataPtr& ptr, c10::cuda::CUDAStream stream);
+template <typename launch_t>
+void looped_cusolver_multistream(
+    int64_t batch_size,
+    int64_t n_streams,
+    const launch_t& launch);
+} // namespace
+
 /*
   The geqrf function computes the QR decomposition of a m x n matrix A.
 
@@ -950,10 +963,11 @@ static void apply_geqrf(const Tensor& A, const Tensor& tau) {
   auto A_stride = matrixStride(A);
   auto tau_stride = tau.size(-1);
 
-  auto A_data = A.data_ptr<scalar_t>();
-  auto tau_data = tau.data_ptr<scalar_t>();
+  auto A_data = A.mutable_data_ptr<scalar_t>();
+  auto tau_data = tau.mutable_data_ptr<scalar_t>();
 
-  auto infos = at::zeros({1}, A.options().dtype(at::kInt));
+  // Per-item info so concurrent auxiliary streams don't race on a shared slot.
+  auto infos = at::zeros({batch_size}, A.options().dtype(at::kInt));
   auto infos_data = infos.data_ptr<int>();
 
   // get the optimal work size and allocate workspace tensor
@@ -980,17 +994,66 @@ static void apply_geqrf(const Tensor& A, const Tensor& tau) {
       at::cuda::getCurrentCUDASolverDnHandle(), m_32, n_32, A_data, lda_32, &lwork);
 #endif // USE_CUSOLVER_64_BIT
 
-  for (decltype(batch_size) i = 0; i < batch_size; i++) {
+  // No upper size gate: larger factorizations naturally overlap less as one geqrf
+  // occupies more of the GPU. Bounded by batch threshold, stream count, and workspace budget.
+  constexpr int64_t kMultiStreamMinBatch = 8;
+  constexpr int64_t kMaxStreams = 8;
+  int64_t n_streams = 1;
+  if (batch_size >= kMultiStreamMinBatch) {
+    n_streams = std::min<int64_t>(batch_size, kMaxStreams);
+    constexpr size_t kMaxAuxWorkspaceBytes = 256ULL << 20;
+#ifdef USE_CUSOLVER_64_BIT
+    if (worksize_device > 0) {
+      n_streams = std::min<int64_t>(
+          n_streams,
+          std::max<int64_t>(1, static_cast<int64_t>(kMaxAuxWorkspaceBytes / worksize_device)));
+    }
+#else
+    const size_t workspace_bytes =
+        sizeof(scalar_t) * static_cast<size_t>(std::max<int>(1, lwork));
+    if (workspace_bytes > 0) {
+      n_streams = std::min<int64_t>(
+          n_streams,
+          std::max<int64_t>(1, static_cast<int64_t>(kMaxAuxWorkspaceBytes / workspace_bytes)));
+    }
+#endif
+  }
+
+  // Allocate one workspace per stream so concurrent geqrf calls never share
+  // scratch storage; the DataPtrs stay alive across the helper join.
+  c10::SmallVector<c10::DataPtr, 8> device_workspaces;
+  device_workspaces.reserve(n_streams);
+#ifdef USE_CUSOLVER_64_BIT
+  c10::SmallVector<c10::DataPtr, 8> host_workspaces;
+  host_workspaces.reserve(n_streams);
+  auto& device_allocator = *at::cuda::getCUDADeviceAllocator();
+  auto& host_allocator = *at::getCPUAllocator();
+  for (int64_t k = 0; k < n_streams; ++k) {
+    device_workspaces.push_back(device_allocator.allocate(worksize_device));
+    host_workspaces.push_back(host_allocator.allocate(worksize_host));
+  }
+#else
+  auto& allocator = *at::cuda::getCUDADeviceAllocator();
+  for (int64_t k = 0; k < n_streams; ++k) {
+    device_workspaces.push_back(
+        allocator.allocate(sizeof(scalar_t) * std::max<int>(1, lwork)));
+  }
+#endif
+
+  auto launch = [&](int64_t i,
+                    int64_t stream_id,
+                    cusolverDnHandle_t handle,
+                    c10::cuda::CUDAStream stream) {
+    if (i < n_streams) {
+      // Record each backing allocation once per auxiliary stream.
+      record_tensor_on_stream(A, stream);
+      record_tensor_on_stream(tau, stream);
+      record_tensor_on_stream(infos, stream);
+      record_dataptr_on_stream(device_workspaces[stream_id], stream);
+    }
     scalar_t* A_working_ptr = &A_data[i * A_stride];
     scalar_t* tau_working_ptr = &tau_data[i * tau_stride];
-    auto handle = at::cuda::getCurrentCUDASolverDnHandle();
-
 #ifdef USE_CUSOLVER_64_BIT
-    // allocate workspace storage on device and host
-    auto& device_allocator = *at::cuda::getCUDADeviceAllocator();
-    auto work_device_data = device_allocator.allocate(worksize_device);
-    auto& host_allocator = *at::getCPUAllocator();
-    auto work_host_data = host_allocator.allocate(worksize_host);
     at::cuda::solver::xgeqrf<scalar_t>(
         handle,
         params,
@@ -999,15 +1062,12 @@ static void apply_geqrf(const Tensor& A, const Tensor& tau) {
         A_working_ptr,
         lda,
         tau_working_ptr,
-        static_cast<scalar_t*>(work_device_data.get()),
+        static_cast<scalar_t*>(device_workspaces[stream_id].get()),
         worksize_device,
-        static_cast<scalar_t*>(work_host_data.get()),
+        static_cast<scalar_t*>(host_workspaces[stream_id].get()),
         worksize_host,
-        infos_data);
+        infos_data + i);
 #else
-    // allocate workspace storage on device
-    auto& allocator = *at::cuda::getCUDADeviceAllocator();
-    auto work_data = allocator.allocate(sizeof(scalar_t) * std::max<int>(1, lwork));
     at::cuda::solver::geqrf<scalar_t>(
         handle,
         m_32,
@@ -1015,15 +1075,16 @@ static void apply_geqrf(const Tensor& A, const Tensor& tau) {
         A_working_ptr,
         lda_32,
         tau_working_ptr,
-        static_cast<scalar_t*>(work_data.get()),
+        static_cast<scalar_t*>(device_workspaces[stream_id].get()),
         lwork,
-        infos_data);
+        infos_data + i);
 #endif // USE_CUSOLVER_64_BIT
-  }
+  };
+  looped_cusolver_multistream(batch_size, n_streams, launch);
 
   // info from geqrf only reports if the i-th parameter is wrong, not about the matrix singularity
   // so we don't need to check it all the time
-  TORCH_INTERNAL_ASSERT_DEBUG_ONLY(infos.item().toInt() == 0);
+  TORCH_INTERNAL_ASSERT_DEBUG_ONLY(infos.eq(0).all().item<bool>());
 }
 
 // This is a type dispatching helper function for 'apply_geqrf'
@@ -1715,18 +1776,22 @@ void looped_cusolver_multistream(
     streams.push_back(stream);
   }
 
+  // Join on every exit path (including a throwing launch) so the caller's freed
+  // workspaces/tensors are never reused while an aux stream is still running.
+  auto join = c10::make_scope_exit([&]() {
+    for (auto& stream : streams) {
+      at::cuda::CUDAEvent join_event;
+      join_event.record(stream);
+      join_event.block(main_stream);
+    }
+  });
+
   for (const auto i : c10::irange(batch_size)) {
     const auto stream_id = i % n_streams;
     auto stream = streams[stream_id];
     c10::cuda::CUDAStreamGuard guard(stream);
     auto handle = aux_cusolver_handle(stream);
     launch(i, stream_id, handle, stream);
-  }
-
-  for (auto& stream : streams) {
-    at::cuda::CUDAEvent join_event;
-    join_event.record(stream);
-    join_event.block(main_stream);
   }
 }
 
