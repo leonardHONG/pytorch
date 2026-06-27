@@ -1782,7 +1782,8 @@ class DeviceCachingAllocator {
                 params, size, stream, device_id, alloc_size, stats)
             // release_available_cached_blocks can call cudaFree (via
             // release_block), which is illegal during CUDA graph capture; skip
-            // it under capture, matching the release_cached_blocks branch below.
+            // it under capture, matching the release_cached_blocks branch
+            // below.
             || (C10_LIKELY(!is_capture_context()) &&
                 release_available_cached_blocks(params, context) &&
                 alloc_block(params, false, context, lock))
