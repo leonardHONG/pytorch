@@ -313,7 +313,8 @@ template <
     typename DtypeA,
     typename DtypeB,
     typename DtypeBias,
-    typename DtypeOutput>
+    typename DtypeOutput,
+    typename Scheduler = void>
 void f8f8bf16_rowwise_impl_sm100_sm120(
     at::Tensor XQ, // FP8
     at::Tensor WQ, // FP8
@@ -321,7 +322,9 @@ void f8f8bf16_rowwise_impl_sm100_sm120(
     at::Tensor w_scale,
     std::optional<at::Tensor> bias,
     at::Tensor out,
-    const int swizzle) {
+    const int swizzle,
+    const bool very_low_occupancy = false) {
+  static constexpr bool UseStreamK = !std::is_same_v<Scheduler, void>;
   int M = XQ.size(0);
   int N = WQ.size(1);
   int K = XQ.size(1);
@@ -419,10 +422,17 @@ void f8f8bf16_rowwise_impl_sm100_sm120(
           MainloopScheduleType>::CollectiveOp;
 
   using GemmKernel = at::cuda::detail::enable_3x_kernel_for_sm10_or_later<
-      cutlass::gemm::kernel::GemmUniversal<
-          cute::Shape<int, int, int>,
-          CollectiveMainloop,
-          CollectiveEpilogue>>;
+      std::conditional_t<
+          UseStreamK,
+          cutlass::gemm::kernel::GemmUniversal<
+              cute::Shape<int, int, int>,
+              CollectiveMainloop,
+              CollectiveEpilogue,
+              Scheduler>,
+          cutlass::gemm::kernel::GemmUniversal<
+              cute::Shape<int, int, int>,
+              CollectiveMainloop,
+              CollectiveEpilogue>>>;
 
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
@@ -468,6 +478,21 @@ void f8f8bf16_rowwise_impl_sm100_sm120(
 
   // Set the swizzle size
   arguments.scheduler.max_swizzle_size = swizzle;
+
+  if constexpr (UseStreamK) {
+    using DecompositionMode = cutlass::gemm::kernel::detail::
+        PersistentTileSchedulerSm90StreamKParams::DecompositionMode;
+    using ReductionMode = cutlass::gemm::kernel::detail::
+        PersistentTileSchedulerSm90StreamKParams::ReductionMode;
+    arguments.scheduler.reduction_mode = ReductionMode::Deterministic;
+    if (very_low_occupancy) {
+      constexpr int kSplitKSlices = 8;
+      arguments.scheduler.decomposition_mode = DecompositionMode::SplitK;
+      arguments.scheduler.splits = kSplitKSlices;
+    } else {
+      arguments.scheduler.decomposition_mode = DecompositionMode::Heuristic;
+    }
+  }
 
   // Allocate workspace memory
   auto workspace = XQ.new_empty(
@@ -726,6 +751,32 @@ void dispatch_fp8_rowwise_kernel_on_tile_size(
   int smTarget = at::cuda::getDeviceProperties(out.device().index())->multiProcessorCount;
   if (at::globalContext()._SMCarveout_EXPERIMENTAL().has_value()) {
     smTarget -= at::globalContext()._SMCarveout_EXPERIMENTAL().value();
+  }
+
+  // #153809: low-occupancy + large-K rowwise underuses the GPU (the grid is
+  // sized by M/N tiles only, K is iterated serially per CTA). On sm120, run a
+  // 128 tile (cooperative, Stream-K compatible) + Stream-K so the K work is
+  // spread across SMs. Thresholds tuned on sm120 (RTX PRO 6000); sm100 can be
+  // enabled separately once benchmarked.
+  if constexpr (std::is_same_v<ArchTag, cutlass::arch::Sm120>) {
+    constexpr int64_t kLargeKThreshold = 16384;
+    constexpr int64_t kStreamKOccupancyDivisor = 2;  // enable when tiles*2 < SM
+    constexpr int64_t kSplitKOccupancyDivisor = 8;   // tiles*8 < SM -> SplitK
+    const int64_t K = XQ.size(1);
+    const int64_t output_tiles =
+        static_cast<int64_t>(ceildiv(M, 128)) * ceildiv(N, 128);
+    if (K >= kLargeKThreshold &&
+        output_tiles * kStreamKOccupancyDivisor < smTarget) {
+      const bool very_low_occupancy =
+          output_tiles * kSplitKOccupancyDivisor < smTarget;
+      return f8f8bf16_rowwise_impl_sm100_sm120<
+          ArchTag,
+          /*TileShape=*/cute::Shape<cute::_128, cute::_128, cute::_128>,
+          ClusterShape,
+          Types...,
+          cutlass::gemm::StreamKScheduler>(
+          XQ, WQ, x_scale, w_scale, bias, out, swizzle, very_low_occupancy);
+    }
   }
 
   // We prefer to use smaller tiles (less wasted compute in case of padding),

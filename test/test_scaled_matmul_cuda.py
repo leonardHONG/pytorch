@@ -1337,6 +1337,56 @@ class TestFP8Matmul(TestCase):
         # fp32 output is now supported on both the cuBLAS and CUTLASS row-wise paths.
         test()
 
+    @skipCUDAIf(not SM89OrLater, "rowwise scaled_mm is only supported on sm89 and newer")
+    @parametrize("base_dtype", [torch.bfloat16, torch.float16])
+    @parametrize("shapes", [
+        # Large-K + low-occupancy shapes that exercise the sm120 Stream-K
+        # path (issue #153809); other archs fall back to the data-parallel
+        # kernel. Either way the result must match the emulated reference.
+        # (M, K, N); kept small for CI, full perf sweep is in the PR.
+        (256, 16384, 256),      # SplitK path (very low occupancy)
+        (1024, 16384, 1024),    # Heuristic Stream-K path
+        (256, 16384, 4096),     # non-square Heuristic Stream-K path
+    ])
+    @with_tf32_off
+    def test_scaled_mm_vs_emulated_row_wise_large_k(self, base_dtype, shapes, device):
+        M, K, N = shapes
+        if base_dtype is torch.float16:
+            if torch.version.hip:
+                raise unittest.SkipTest("hipblaslt rowwise _scaled_mm only supports BFloat16")
+            if torch.cuda.is_available() and torch.cuda.get_device_capability() < (9, 0):
+                raise unittest.SkipTest("Need sm90+ for row-wise fp8 w/ cuBLAS")
+
+        torch.manual_seed(42)
+        input_dtype = e4m3_type
+        output_dtype = base_dtype
+
+        x = random_matrix_with_scaled_reduction_dim(M, K, dtype=base_dtype, device=device, reduction_dim=-1)
+        y = random_matrix_with_scaled_reduction_dim(N, K, dtype=base_dtype, device=device, reduction_dim=-1).t()
+
+        x_scales = tensor_to_scale(x, input_dtype, dim=1).float()
+        y_scales = tensor_to_scale(y, input_dtype, dim=0).float()
+
+        x_fp8 = to_fp8_saturated(x * x_scales, e4m3_type)
+        y_fp8 = to_fp8_saturated(y * y_scales, e4m3_type)
+
+        out_scaled_mm = scaled_mm_wrap(
+            x_fp8,
+            y_fp8,
+            scale_a=x_scales.reciprocal(),
+            scale_b=y_scales.reciprocal(),
+            out_dtype=output_dtype,
+        )
+        out_emulated = mm_float8_emulated(
+            x_fp8, x_scales, y_fp8, y_scales, output_dtype
+        )
+        self.assertEqual(out_scaled_mm, out_emulated, atol=7e-2, rtol=7e-2)
+
+        cosine_sim = torch.nn.functional.cosine_similarity(
+            out_emulated.flatten().float(), out_scaled_mm.flatten().float(), dim=0
+        )
+        self.assertGreaterEqual(float(cosine_sim), 0.999)
+
     @unittest.skipIf(not PLATFORM_SUPPORTS_FP8 or IS_WINDOWS, f8_msg)
     @skipCUDAIf(not SM89OrLater, "rowwise implementation is currently sm89-sm100 specific")
     @parametrize("output_dtype", [torch.bfloat16, torch.float16, torch.float32])
